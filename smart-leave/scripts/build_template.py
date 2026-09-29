@@ -1,0 +1,114 @@
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+def ref(n): return {'Ref': n}
+def arn(n): return {'Fn::GetAtt': [n, 'Arn']}
+def sub(s): return {'Fn::Sub': s}
+def res(t, p, **kw): return {'Type': t, 'Properties': p, **kw}
+def allow(a, r): return {'Effect': 'Allow', 'Action': a, 'Resource': r}
+R = {}
+for name, pk, sk in [('People', 'employee_id', None), ('Requests', 'employee_id', 'request_id'),
+                     ('Balances', 'employee_id', 'balance_key'), ('Config', 'leave_type', None), ('Locks', 'employee_id', 'leave_date')]:
+    keys = [(pk, 'HASH')] + ([(sk, 'RANGE')] if sk else [])
+    p = {'BillingMode': 'PAY_PER_REQUEST', 'AttributeDefinitions': [{'AttributeName': k, 'AttributeType': 'S'} for k, _ in keys],
+         'KeySchema': [{'AttributeName': k, 'KeyType': t} for k, t in keys], 'SSESpecification': {'SSEEnabled': True},
+         'PointInTimeRecoverySpecification': {'PointInTimeRecoveryEnabled': True}}
+    if name == 'Requests': p['StreamSpecification'] = {'StreamViewType': 'NEW_AND_OLD_IMAGES'}
+    R[name] = res('AWS::DynamoDB::Table', p, DeletionPolicy='Retain', UpdateReplacePolicy='Retain')
+R['Web'] = res('AWS::S3::Bucket', {'PublicAccessBlockConfiguration': {'BlockPublicAcls': True, 'BlockPublicPolicy': True, 'IgnorePublicAcls': True, 'RestrictPublicBuckets': True},
+    'BucketEncryption': {'ServerSideEncryptionConfiguration': [{'ServerSideEncryptionByDefault': {'SSEAlgorithm': 'AES256'}}]}}, DeletionPolicy='Retain', UpdateReplacePolicy='Retain')
+R['OAC'] = res('AWS::CloudFront::OriginAccessControl', {'OriginAccessControlConfig': {'Name': sub('${AWS::StackName}-oac'), 'OriginAccessControlOriginType': 's3', 'SigningBehavior': 'always', 'SigningProtocol': 'sigv4'}})
+R['CDN'] = res('AWS::CloudFront::Distribution', {'DistributionConfig': {'Enabled': True, 'DefaultRootObject': 'index.html', 'PriceClass': 'PriceClass_100',
+    'Origins': [{'Id': 'web', 'DomainName': {'Fn::GetAtt': ['Web', 'RegionalDomainName']}, 'OriginAccessControlId': ref('OAC'), 'S3OriginConfig': {'OriginAccessIdentity': ''}}],
+    'DefaultCacheBehavior': {'TargetOriginId': 'web', 'ViewerProtocolPolicy': 'redirect-to-https', 'AllowedMethods': ['GET', 'HEAD'],
+        'ForwardedValues': {'QueryString': False}, 'MinTTL': 0, 'DefaultTTL': 60, 'MaxTTL': 300,
+        'ResponseHeadersPolicyId': '67f7725c-6f97-4210-82d7-5512b31e9d03'}, 'ViewerCertificate': {'CloudFrontDefaultCertificate': True}}})
+portal = sub('https://${CDN.DomainName}')
+R['WebPolicy'] = res('AWS::S3::BucketPolicy', {'Bucket': ref('Web'), 'PolicyDocument': {'Version': '2012-10-17', 'Statement': [
+    {'Effect': 'Allow', 'Principal': {'Service': 'cloudfront.amazonaws.com'}, 'Action': 's3:GetObject', 'Resource': sub('${Web.Arn}/*'),
+     'Condition': {'StringEquals': {'AWS:SourceArn': sub('arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${CDN}')}}},
+    {'Effect': 'Deny', 'Principal': '*', 'Action': 's3:*', 'Resource': [arn('Web'), sub('${Web.Arn}/*')], 'Condition': {'Bool': {'aws:SecureTransport': 'false'}}}]}})
+R['Pool'] = res('AWS::Cognito::UserPool', {'UserPoolName': sub('${AWS::StackName}-users'), 'AliasAttributes': ['email'], 'UsernameConfiguration': {'CaseSensitive': False},
+    'AdminCreateUserConfig': {'AllowAdminCreateUserOnly': True, 'InviteMessageTemplate': {'EmailSubject': 'Your LeaveFlow account',
+        'EmailMessage': sub('Your username is {username}. Temporary password: {####}. Open https://${CDN.DomainName} and choose a new password.')}},
+    'Policies': {'PasswordPolicy': {'MinimumLength': 12, 'RequireUppercase': True, 'RequireLowercase': True, 'RequireNumbers': True, 'RequireSymbols': True, 'TemporaryPasswordValidityDays': 7}},
+    'EmailConfiguration': {'EmailSendingAccount': 'DEVELOPER', 'SourceArn': ref('SESIdentityArn'), 'From': ref('SenderEmail')}}, DeletionPolicy='Retain', UpdateReplacePolicy='Retain')
+R['Client'] = res('AWS::Cognito::UserPoolClient', {'UserPoolId': ref('Pool'), 'GenerateSecret': False, 'ExplicitAuthFlows': ['ALLOW_USER_PASSWORD_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+    'PreventUserExistenceErrors': 'ENABLED', 'ReadAttributes': ['email'], 'WriteAttributes': ['email'], 'IdTokenValidity': 1, 'AccessTokenValidity': 1})
+for group in ['Employee', 'Manager', 'HRAdmin']:
+    R[group+'Group'] = res('AWS::Cognito::UserPoolGroup', {'UserPoolId': ref('Pool'), 'GroupName': group})
+R['ManagerTopic'] = res('AWS::SNS::Topic', {})
+R['Failures'] = res('AWS::SNS::Topic', {'Subscription': [{'Protocol': 'email', 'Endpoint': ref('HREmail')}]})
+R['DeadLetters'] = res('AWS::SQS::Queue', {'MessageRetentionPeriod': 1209600, 'SqsManagedSseEnabled': True})
+R['SigningSecret'] = res('AWS::SecretsManager::Secret', {'Name': sub('${AWS::StackName}-signing-secret'), 'GenerateSecretString': {'PasswordLength': 64, 'ExcludePunctuation': True}})
+R['Api'] = res('AWS::Serverless::Api', {'StageName': 'prod', 'EndpointConfiguration': {'Type': 'REGIONAL'},
+    'Cors': {'AllowOrigin': sub("'https://${CDN.DomainName}'"), 'AllowHeaders': "'Content-Type,Authorization'", 'AllowMethods': "'GET,POST,OPTIONS'"},
+    'Auth': {'DefaultAuthorizer': 'Cognito', 'AddDefaultAuthorizerToCorsPreflight': False, 'Authorizers': {'Cognito': {'UserPoolArn': arn('Pool')}}}})
+env = {k: ref(v) for k, v in [('PEOPLE', 'People'), ('REQUESTS', 'Requests'), ('BALANCES', 'Balances'), ('CONFIG', 'Config'), ('LOCKS', 'Locks')]}
+env.update(PORTAL=portal, SENDER=ref('SenderEmail'), HR_EMAIL=ref('HREmail'), MANAGER_TOPIC=ref('ManagerTopic'), SIGNING_SECRET=ref('SigningSecret'))
+db = allow(['dynamodb:ConditionCheckItem', 'dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:Query', 'dynamodb:Scan'], [arn(n) for n in ['People','Requests','Balances','Config','Locks']])
+mail = {
+    'Effect': 'Allow',
+    'Action': ['ses:SendEmail'],
+    'Resource': sub('arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*'),
+    'Condition': {
+        'StringEquals': {
+            'ses:FromAddress': ref('SenderEmail')
+        }
+    }
+}
+sns = allow(['sns:Publish'], [ref('ManagerTopic'), ref('Failures')])
+secret = allow(['secretsmanager:GetSecretValue'], ref('SigningSecret'))
+callback = allow(['states:SendTaskSuccess'], '*')
+def fn(name, handler, policies, events=None, extra=None):
+    p = {'CodeUri': 'backend/', 'Runtime': 'python3.14', 'Handler': 'app.'+handler, 'MemorySize': 256, 'Timeout': 60,
+         'Environment': {'Variables': {**env, **(extra or {})}}, 'Policies': [{'Version': '2012-10-17', 'Statement': policies}]}
+    if events: p['Events'] = events
+    R[name] = res('AWS::Serverless::Function', p)
+    R[name+'Logs'] = res('AWS::Logs::LogGroup', {'LogGroupName': sub('/aws/lambda/${'+name+'}'), 'RetentionInDays': 14})
+fn('ApiFunction', 'api', [db, secret], {'Proxy': {'Type': 'Api', 'Properties': {'RestApiId': ref('Api'), 'Path': '/{proxy+}', 'Method': 'ANY'}},
+    'ApprovalLink': {'Type': 'Api', 'Properties': {'RestApiId': ref('Api'), 'Path': '/approval', 'Method': 'GET', 'Auth': {'Authorizer': 'NONE'}}}})
+fn('Register', 'register', [db, secret, mail, sns, callback], extra={'API_BASE': sub('https://${Api}.execute-api.${AWS::Region}.amazonaws.com/prod'), 'APPROVAL_SECONDS': ref('ApprovalSeconds')})
+fn('Finish', 'finish', [db])
+fn('Remind', 'remind', [db, mail, sns])
+fn('Weekly', 'weekly', [db, mail], {'Weekly': {'Type': 'Schedule', 'Properties': {'Schedule': 'cron(0 4 ? * MON *)'}}})
+R['Weekly']['Properties']['Timeout'] = 300
+retry = [{'ErrorEquals': ['States.TaskFailed'], 'IntervalSeconds': 2, 'MaxAttempts': 4, 'BackoffRate': 2}]
+states = {'Prepare': {'Type': 'Pass', 'Parameters': {'employee_id.$':'$.employee_id', 'request_id.$':'$.request_id', 'needs_hr.$':'$.needs_hr',
+    'seconds.$': sub("States.StringToJson('${ApprovalSeconds}')"), 'rounds': 0}, 'Next': 'ManagerApproval'}}
+for stage, title, following in [('manager','Manager','NeedHR'), ('hr','HR','Approve')]:
+    states[title+'Approval'] = {'Type':'Task', 'Resource':'arn:aws:states:::lambda:invoke.waitForTaskToken',
+        'Parameters': {'FunctionName': arn('Register'), 'Payload': {'employee_id.$':'$.employee_id','request_id.$':'$.request_id', 'stage':stage, 'token.$':'$$.Task.Token'}},
+        'TimeoutSecondsPath':'$.seconds', 'ResultPath':'$.decision', 'Retry':retry,
+        'Catch':[{'ErrorEquals':['States.Timeout'],'ResultPath':None,'Next':title+'Reminder'}, {'ErrorEquals':['States.ALL'],'ResultPath':'$.error','Next':'FailureNotice'}], 'Next':title+'Decision'}
+    states[title+'Decision'] = {'Type':'Choice', 'Choices':[{'Variable':'$.decision.decision','StringEquals':'approve','Next':following}], 'Default':'Reject'}
+    states[title+'Reminder'] = {'Type':'Task','Resource':arn('Remind'), 'Parameters':{'employee_id.$':'$.employee_id','request_id.$':'$.request_id','stage':stage},
+        'ResultPath':None,'Retry':retry, 'Catch':[{'ErrorEquals':['States.ALL'],'ResultPath':'$.error','Next':'FailureNotice'}], 'Next': title+'Count'}
+    states[title+'Count'] = {'Type':'Pass','Parameters':{'employee_id.$':'$.employee_id','request_id.$':'$.request_id','needs_hr.$':'$.needs_hr','seconds.$':'$.seconds','rounds.$':'States.MathAdd($.rounds, 1)'}, 'Next':title+'Expiry'}
+    states[title+'Expiry'] = {'Type':'Choice','Choices':[{'Variable':'$.rounds','NumericGreaterThanEquals':15,'Next':'Expire'}], 'Default':title+'Approval'}
+states['NeedHR'] = {'Type':'Choice','Choices':[{'Variable':'$.needs_hr','BooleanEquals':True,'Next':'HRApproval'}], 'Default':'Approve'}
+for name in ['Approve','Reject','Expire']:
+    states[name] = {'Type':'Task','Resource':arn('Finish'), 'Parameters':{'employee_id.$':'$.employee_id','request_id.$':'$.request_id','action':name.lower()},
+        'Retry':retry,'Catch':[{'ErrorEquals':['States.ALL'],'ResultPath':'$.error','Next':'FailureNotice'}], 'End':True}
+states['FailureNotice'] = {'Type':'Task','Resource':'arn:aws:states:::sns:publish','Parameters':{'TopicArn':ref('Failures'),'Subject':'Leave workflow failed','Message.$':'States.JsonToString($)'},'Next':'Failed'}
+states['Failed'] = {'Type':'Fail','Error':'LeaveWorkflowFailed'}
+definition = {'Comment':'Human approval callbacks; quota debit occurs only at final approval.', 'StartAt':'Prepare', 'States':states}
+R['Workflow'] = res('AWS::Serverless::StateMachine', {'Name':sub('${AWS::StackName}-workflow'), 'Type':'STANDARD','Definition':definition,
+    'Policies':[{'Version':'2012-10-17','Statement':[allow(['lambda:InvokeFunction'],[arn('Register'),arn('Remind'),arn('Finish')]),sns]}]})
+fn('Changes', 'changes', [mail, callback, allow(['states:StartExecution'],ref('Workflow')),allow(['sqs:SendMessage'],arn('DeadLetters'))],
+    {'Stream':{'Type':'DynamoDB','Properties':{'Stream':{'Fn::GetAtt':['Requests','StreamArn']},'StartingPosition':'TRIM_HORIZON','BatchSize':1,
+        'MaximumRetryAttempts':5,'BisectBatchOnFunctionError':True,'DestinationConfig':{'OnFailure':{'Type':'SQS','Destination':arn('DeadLetters')}}}}}, {'WORKFLOW':ref('Workflow')})
+R['DeadLetterAlarm'] = res('AWS::CloudWatch::Alarm', {'AlarmDescription':'Leave notification or workflow-start event needs replay; inspect failed stream records.',
+    'Namespace':'AWS/SQS','MetricName':'ApproximateNumberOfMessagesVisible','Dimensions':[{'Name':'QueueName','Value':{'Fn::GetAtt':['DeadLetters','QueueName']}}],
+    'Statistic':'Maximum','Period':60,'EvaluationPeriods':1,'Threshold':0,'ComparisonOperator':'GreaterThanThreshold','TreatMissingData':'notBreaching','AlarmActions':[ref('Failures')]})
+outputs = {'PortalUrl':portal,'ApiUrl':sub('https://${Api}.execute-api.${AWS::Region}.amazonaws.com/prod'),'UserPoolId':ref('Pool'),'ClientId':ref('Client'),
+    'WebBucket':ref('Web'),'PeopleTable':ref('People'),'ConfigTable':ref('Config'),'BalancesTable':ref('Balances'),'RequestsTable':ref('Requests'),
+    'ManagerTopicArn':ref('ManagerTopic'),'WorkflowArn':ref('Workflow'),'Region':ref('AWS::Region'),'WeeklyFunction':ref('Weekly'),'DeadLetterQueueUrl':ref('DeadLetters')}
+template = {'AWSTemplateFormatVersion':'2010-09-09','Transform':'AWS::Serverless-2016-10-31','Description':'Standalone LeaveFlow leave and absence management',
+    'Parameters':{'SenderEmail':{'Type':'String'},'HREmail':{'Type':'String'},'SESIdentityArn':{'Type':'String'},
+    'ApprovalSeconds':{'Type':'Number','Default':172800,'AllowedValues':[60,172800],'Description':'172800 = 48 hours; 60 for demo only'}},
+    'Resources':R,'Outputs':{k:{'Value':v} for k,v in outputs.items()}}
+(ROOT/'template.json').write_text(json.dumps(template,indent=2)+'\n')
+(ROOT/'docs/workflow.asl.json').write_text(json.dumps(definition,indent=2)+'\n')
+print('Generated template.json and docs/workflow.asl.json')

@@ -1,0 +1,1800 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Transform": "AWS::Serverless-2016-10-31",
+  "Description": "Standalone LeaveFlow leave and absence management",
+  "Parameters": {
+    "SenderEmail": {
+      "Type": "String"
+    },
+    "HREmail": {
+      "Type": "String"
+    },
+    "SESIdentityArn": {
+      "Type": "String"
+    },
+    "ApprovalSeconds": {
+      "Type": "Number",
+      "Default": 172800,
+      "AllowedValues": [
+        60,
+        172800
+      ],
+      "Description": "172800 = 48 hours; 60 for demo only"
+    }
+  },
+  "Resources": {
+    "People": {
+      "Type": "AWS::DynamoDB::Table",
+      "Properties": {
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "employee_id",
+            "AttributeType": "S"
+          }
+        ],
+        "KeySchema": [
+          {
+            "AttributeName": "employee_id",
+            "KeyType": "HASH"
+          }
+        ],
+        "SSESpecification": {
+          "SSEEnabled": true
+        },
+        "PointInTimeRecoverySpecification": {
+          "PointInTimeRecoveryEnabled": true
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "Requests": {
+      "Type": "AWS::DynamoDB::Table",
+      "Properties": {
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "employee_id",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "request_id",
+            "AttributeType": "S"
+          }
+        ],
+        "KeySchema": [
+          {
+            "AttributeName": "employee_id",
+            "KeyType": "HASH"
+          },
+          {
+            "AttributeName": "request_id",
+            "KeyType": "RANGE"
+          }
+        ],
+        "SSESpecification": {
+          "SSEEnabled": true
+        },
+        "PointInTimeRecoverySpecification": {
+          "PointInTimeRecoveryEnabled": true
+        },
+        "StreamSpecification": {
+          "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "Balances": {
+      "Type": "AWS::DynamoDB::Table",
+      "Properties": {
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "employee_id",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "balance_key",
+            "AttributeType": "S"
+          }
+        ],
+        "KeySchema": [
+          {
+            "AttributeName": "employee_id",
+            "KeyType": "HASH"
+          },
+          {
+            "AttributeName": "balance_key",
+            "KeyType": "RANGE"
+          }
+        ],
+        "SSESpecification": {
+          "SSEEnabled": true
+        },
+        "PointInTimeRecoverySpecification": {
+          "PointInTimeRecoveryEnabled": true
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "Config": {
+      "Type": "AWS::DynamoDB::Table",
+      "Properties": {
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "leave_type",
+            "AttributeType": "S"
+          }
+        ],
+        "KeySchema": [
+          {
+            "AttributeName": "leave_type",
+            "KeyType": "HASH"
+          }
+        ],
+        "SSESpecification": {
+          "SSEEnabled": true
+        },
+        "PointInTimeRecoverySpecification": {
+          "PointInTimeRecoveryEnabled": true
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "Locks": {
+      "Type": "AWS::DynamoDB::Table",
+      "Properties": {
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "employee_id",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "leave_date",
+            "AttributeType": "S"
+          }
+        ],
+        "KeySchema": [
+          {
+            "AttributeName": "employee_id",
+            "KeyType": "HASH"
+          },
+          {
+            "AttributeName": "leave_date",
+            "KeyType": "RANGE"
+          }
+        ],
+        "SSESpecification": {
+          "SSEEnabled": true
+        },
+        "PointInTimeRecoverySpecification": {
+          "PointInTimeRecoveryEnabled": true
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "Web": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        },
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "OAC": {
+      "Type": "AWS::CloudFront::OriginAccessControl",
+      "Properties": {
+        "OriginAccessControlConfig": {
+          "Name": {
+            "Fn::Sub": "${AWS::StackName}-oac"
+          },
+          "OriginAccessControlOriginType": "s3",
+          "SigningBehavior": "always",
+          "SigningProtocol": "sigv4"
+        }
+      }
+    },
+    "CDN": {
+      "Type": "AWS::CloudFront::Distribution",
+      "Properties": {
+        "DistributionConfig": {
+          "Enabled": true,
+          "DefaultRootObject": "index.html",
+          "PriceClass": "PriceClass_100",
+          "Origins": [
+            {
+              "Id": "web",
+              "DomainName": {
+                "Fn::GetAtt": [
+                  "Web",
+                  "RegionalDomainName"
+                ]
+              },
+              "OriginAccessControlId": {
+                "Ref": "OAC"
+              },
+              "S3OriginConfig": {
+                "OriginAccessIdentity": ""
+              }
+            }
+          ],
+          "DefaultCacheBehavior": {
+            "TargetOriginId": "web",
+            "ViewerProtocolPolicy": "redirect-to-https",
+            "AllowedMethods": [
+              "GET",
+              "HEAD"
+            ],
+            "ForwardedValues": {
+              "QueryString": false
+            },
+            "MinTTL": 0,
+            "DefaultTTL": 60,
+            "MaxTTL": 300,
+            "ResponseHeadersPolicyId": "67f7725c-6f97-4210-82d7-5512b31e9d03"
+          },
+          "ViewerCertificate": {
+            "CloudFrontDefaultCertificate": true
+          }
+        }
+      }
+    },
+    "WebPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Properties": {
+        "Bucket": {
+          "Ref": "Web"
+        },
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "cloudfront.amazonaws.com"
+              },
+              "Action": "s3:GetObject",
+              "Resource": {
+                "Fn::Sub": "${Web.Arn}/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "AWS:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${CDN}"
+                  }
+                }
+              }
+            },
+            {
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:*",
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "Web",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Sub": "${Web.Arn}/*"
+                }
+              ],
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "Pool": {
+      "Type": "AWS::Cognito::UserPool",
+      "Properties": {
+        "UserPoolName": {
+          "Fn::Sub": "${AWS::StackName}-users"
+        },
+        "AliasAttributes": [
+          "email"
+        ],
+        "UsernameConfiguration": {
+          "CaseSensitive": false
+        },
+        "AdminCreateUserConfig": {
+          "AllowAdminCreateUserOnly": true,
+          "InviteMessageTemplate": {
+            "EmailSubject": "Your LeaveFlow account",
+            "EmailMessage": {
+              "Fn::Sub": "Your username is {username}. Temporary password: {####}. Open https://${CDN.DomainName} and choose a new password."
+            }
+          }
+        },
+        "Policies": {
+          "PasswordPolicy": {
+            "MinimumLength": 12,
+            "RequireUppercase": true,
+            "RequireLowercase": true,
+            "RequireNumbers": true,
+            "RequireSymbols": true,
+            "TemporaryPasswordValidityDays": 7
+          }
+        },
+        "EmailConfiguration": {
+          "EmailSendingAccount": "DEVELOPER",
+          "SourceArn": {
+            "Ref": "SESIdentityArn"
+          },
+          "From": {
+            "Ref": "SenderEmail"
+          }
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "Client": {
+      "Type": "AWS::Cognito::UserPoolClient",
+      "Properties": {
+        "UserPoolId": {
+          "Ref": "Pool"
+        },
+        "GenerateSecret": false,
+        "ExplicitAuthFlows": [
+          "ALLOW_USER_PASSWORD_AUTH",
+          "ALLOW_REFRESH_TOKEN_AUTH"
+        ],
+        "PreventUserExistenceErrors": "ENABLED",
+        "ReadAttributes": [
+          "email"
+        ],
+        "WriteAttributes": [
+          "email"
+        ],
+        "IdTokenValidity": 1,
+        "AccessTokenValidity": 1
+      }
+    },
+    "EmployeeGroup": {
+      "Type": "AWS::Cognito::UserPoolGroup",
+      "Properties": {
+        "UserPoolId": {
+          "Ref": "Pool"
+        },
+        "GroupName": "Employee"
+      }
+    },
+    "ManagerGroup": {
+      "Type": "AWS::Cognito::UserPoolGroup",
+      "Properties": {
+        "UserPoolId": {
+          "Ref": "Pool"
+        },
+        "GroupName": "Manager"
+      }
+    },
+    "HRAdminGroup": {
+      "Type": "AWS::Cognito::UserPoolGroup",
+      "Properties": {
+        "UserPoolId": {
+          "Ref": "Pool"
+        },
+        "GroupName": "HRAdmin"
+      }
+    },
+    "ManagerTopic": {
+      "Type": "AWS::SNS::Topic",
+      "Properties": {}
+    },
+    "Failures": {
+      "Type": "AWS::SNS::Topic",
+      "Properties": {
+        "Subscription": [
+          {
+            "Protocol": "email",
+            "Endpoint": {
+              "Ref": "HREmail"
+            }
+          }
+        ]
+      }
+    },
+    "DeadLetters": {
+      "Type": "AWS::SQS::Queue",
+      "Properties": {
+        "MessageRetentionPeriod": 1209600,
+        "SqsManagedSseEnabled": true
+      }
+    },
+    "SigningSecret": {
+      "Type": "AWS::SecretsManager::Secret",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${AWS::StackName}-signing-secret"
+        },
+        "GenerateSecretString": {
+          "PasswordLength": 64,
+          "ExcludePunctuation": true
+        }
+      }
+    },
+    "Api": {
+      "Type": "AWS::Serverless::Api",
+      "Properties": {
+        "StageName": "prod",
+        "EndpointConfiguration": {
+          "Type": "REGIONAL"
+        },
+        "Cors": {
+          "AllowOrigin": {
+            "Fn::Sub": "'https://${CDN.DomainName}'"
+          },
+          "AllowHeaders": "'Content-Type,Authorization'",
+          "AllowMethods": "'GET,POST,OPTIONS'"
+        },
+        "Auth": {
+          "DefaultAuthorizer": "Cognito",
+          "AddDefaultAuthorizerToCorsPreflight": false,
+          "Authorizers": {
+            "Cognito": {
+              "UserPoolArn": {
+                "Fn::GetAtt": [
+                  "Pool",
+                  "Arn"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "ApiFunction": {
+      "Type": "AWS::Serverless::Function",
+      "Properties": {
+        "CodeUri": "backend/",
+        "Runtime": "python3.14",
+        "Handler": "app.api",
+        "MemorySize": 256,
+        "Timeout": 60,
+        "Environment": {
+          "Variables": {
+            "PEOPLE": {
+              "Ref": "People"
+            },
+            "REQUESTS": {
+              "Ref": "Requests"
+            },
+            "BALANCES": {
+              "Ref": "Balances"
+            },
+            "CONFIG": {
+              "Ref": "Config"
+            },
+            "LOCKS": {
+              "Ref": "Locks"
+            },
+            "PORTAL": {
+              "Fn::Sub": "https://${CDN.DomainName}"
+            },
+            "SENDER": {
+              "Ref": "SenderEmail"
+            },
+            "HR_EMAIL": {
+              "Ref": "HREmail"
+            },
+            "MANAGER_TOPIC": {
+              "Ref": "ManagerTopic"
+            },
+            "SIGNING_SECRET": {
+              "Ref": "SigningSecret"
+            }
+          }
+        },
+        "Policies": [
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "dynamodb:ConditionCheckItem",
+                  "dynamodb:GetItem",
+                  "dynamodb:PutItem",
+                  "dynamodb:UpdateItem",
+                  "dynamodb:Query",
+                  "dynamodb:Scan"
+                ],
+                "Resource": [
+                  {
+                    "Fn::GetAtt": [
+                      "People",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Requests",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Balances",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Config",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Locks",
+                      "Arn"
+                    ]
+                  }
+                ]
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "secretsmanager:GetSecretValue"
+                ],
+                "Resource": {
+                  "Ref": "SigningSecret"
+                }
+              }
+            ]
+          }
+        ],
+        "Events": {
+          "Proxy": {
+            "Type": "Api",
+            "Properties": {
+              "RestApiId": {
+                "Ref": "Api"
+              },
+              "Path": "/{proxy+}",
+              "Method": "ANY"
+            }
+          },
+          "ApprovalLink": {
+            "Type": "Api",
+            "Properties": {
+              "RestApiId": {
+                "Ref": "Api"
+              },
+              "Path": "/approval",
+              "Method": "GET",
+              "Auth": {
+                "Authorizer": "NONE"
+              }
+            }
+          }
+        }
+      }
+    },
+    "ApiFunctionLogs": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${ApiFunction}"
+        },
+        "RetentionInDays": 14
+      }
+    },
+    "Register": {
+      "Type": "AWS::Serverless::Function",
+      "Properties": {
+        "CodeUri": "backend/",
+        "Runtime": "python3.14",
+        "Handler": "app.register",
+        "MemorySize": 256,
+        "Timeout": 60,
+        "Environment": {
+          "Variables": {
+            "PEOPLE": {
+              "Ref": "People"
+            },
+            "REQUESTS": {
+              "Ref": "Requests"
+            },
+            "BALANCES": {
+              "Ref": "Balances"
+            },
+            "CONFIG": {
+              "Ref": "Config"
+            },
+            "LOCKS": {
+              "Ref": "Locks"
+            },
+            "PORTAL": {
+              "Fn::Sub": "https://${CDN.DomainName}"
+            },
+            "SENDER": {
+              "Ref": "SenderEmail"
+            },
+            "HR_EMAIL": {
+              "Ref": "HREmail"
+            },
+            "MANAGER_TOPIC": {
+              "Ref": "ManagerTopic"
+            },
+            "SIGNING_SECRET": {
+              "Ref": "SigningSecret"
+            },
+            "API_BASE": {
+              "Fn::Sub": "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/prod"
+            },
+            "APPROVAL_SECONDS": {
+              "Ref": "ApprovalSeconds"
+            }
+          }
+        },
+        "Policies": [
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "dynamodb:ConditionCheckItem",
+                  "dynamodb:GetItem",
+                  "dynamodb:PutItem",
+                  "dynamodb:UpdateItem",
+                  "dynamodb:Query",
+                  "dynamodb:Scan"
+                ],
+                "Resource": [
+                  {
+                    "Fn::GetAtt": [
+                      "People",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Requests",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Balances",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Config",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Locks",
+                      "Arn"
+                    ]
+                  }
+                ]
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "secretsmanager:GetSecretValue"
+                ],
+                "Resource": {
+                  "Ref": "SigningSecret"
+                }
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "ses:SendEmail"
+                ],
+                "Resource": {
+                  "Fn::Sub": "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
+                },
+                "Condition": {
+                  "StringEquals": {
+                    "ses:FromAddress": {
+                      "Ref": "SenderEmail"
+                    }
+                  }
+                }
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "sns:Publish"
+                ],
+                "Resource": [
+                  {
+                    "Ref": "ManagerTopic"
+                  },
+                  {
+                    "Ref": "Failures"
+                  }
+                ]
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "states:SendTaskSuccess"
+                ],
+                "Resource": "*"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "RegisterLogs": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${Register}"
+        },
+        "RetentionInDays": 14
+      }
+    },
+    "Finish": {
+      "Type": "AWS::Serverless::Function",
+      "Properties": {
+        "CodeUri": "backend/",
+        "Runtime": "python3.14",
+        "Handler": "app.finish",
+        "MemorySize": 256,
+        "Timeout": 60,
+        "Environment": {
+          "Variables": {
+            "PEOPLE": {
+              "Ref": "People"
+            },
+            "REQUESTS": {
+              "Ref": "Requests"
+            },
+            "BALANCES": {
+              "Ref": "Balances"
+            },
+            "CONFIG": {
+              "Ref": "Config"
+            },
+            "LOCKS": {
+              "Ref": "Locks"
+            },
+            "PORTAL": {
+              "Fn::Sub": "https://${CDN.DomainName}"
+            },
+            "SENDER": {
+              "Ref": "SenderEmail"
+            },
+            "HR_EMAIL": {
+              "Ref": "HREmail"
+            },
+            "MANAGER_TOPIC": {
+              "Ref": "ManagerTopic"
+            },
+            "SIGNING_SECRET": {
+              "Ref": "SigningSecret"
+            }
+          }
+        },
+        "Policies": [
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "dynamodb:ConditionCheckItem",
+                  "dynamodb:GetItem",
+                  "dynamodb:PutItem",
+                  "dynamodb:UpdateItem",
+                  "dynamodb:Query",
+                  "dynamodb:Scan"
+                ],
+                "Resource": [
+                  {
+                    "Fn::GetAtt": [
+                      "People",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Requests",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Balances",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Config",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Locks",
+                      "Arn"
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "FinishLogs": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${Finish}"
+        },
+        "RetentionInDays": 14
+      }
+    },
+    "Remind": {
+      "Type": "AWS::Serverless::Function",
+      "Properties": {
+        "CodeUri": "backend/",
+        "Runtime": "python3.14",
+        "Handler": "app.remind",
+        "MemorySize": 256,
+        "Timeout": 60,
+        "Environment": {
+          "Variables": {
+            "PEOPLE": {
+              "Ref": "People"
+            },
+            "REQUESTS": {
+              "Ref": "Requests"
+            },
+            "BALANCES": {
+              "Ref": "Balances"
+            },
+            "CONFIG": {
+              "Ref": "Config"
+            },
+            "LOCKS": {
+              "Ref": "Locks"
+            },
+            "PORTAL": {
+              "Fn::Sub": "https://${CDN.DomainName}"
+            },
+            "SENDER": {
+              "Ref": "SenderEmail"
+            },
+            "HR_EMAIL": {
+              "Ref": "HREmail"
+            },
+            "MANAGER_TOPIC": {
+              "Ref": "ManagerTopic"
+            },
+            "SIGNING_SECRET": {
+              "Ref": "SigningSecret"
+            }
+          }
+        },
+        "Policies": [
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "dynamodb:ConditionCheckItem",
+                  "dynamodb:GetItem",
+                  "dynamodb:PutItem",
+                  "dynamodb:UpdateItem",
+                  "dynamodb:Query",
+                  "dynamodb:Scan"
+                ],
+                "Resource": [
+                  {
+                    "Fn::GetAtt": [
+                      "People",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Requests",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Balances",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Config",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Locks",
+                      "Arn"
+                    ]
+                  }
+                ]
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "ses:SendEmail"
+                ],
+                "Resource": {
+                  "Fn::Sub": "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
+                },
+                "Condition": {
+                  "StringEquals": {
+                    "ses:FromAddress": {
+                      "Ref": "SenderEmail"
+                    }
+                  }
+                }
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "sns:Publish"
+                ],
+                "Resource": [
+                  {
+                    "Ref": "ManagerTopic"
+                  },
+                  {
+                    "Ref": "Failures"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "RemindLogs": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${Remind}"
+        },
+        "RetentionInDays": 14
+      }
+    },
+    "Weekly": {
+      "Type": "AWS::Serverless::Function",
+      "Properties": {
+        "CodeUri": "backend/",
+        "Runtime": "python3.14",
+        "Handler": "app.weekly",
+        "MemorySize": 256,
+        "Timeout": 300,
+        "Environment": {
+          "Variables": {
+            "PEOPLE": {
+              "Ref": "People"
+            },
+            "REQUESTS": {
+              "Ref": "Requests"
+            },
+            "BALANCES": {
+              "Ref": "Balances"
+            },
+            "CONFIG": {
+              "Ref": "Config"
+            },
+            "LOCKS": {
+              "Ref": "Locks"
+            },
+            "PORTAL": {
+              "Fn::Sub": "https://${CDN.DomainName}"
+            },
+            "SENDER": {
+              "Ref": "SenderEmail"
+            },
+            "HR_EMAIL": {
+              "Ref": "HREmail"
+            },
+            "MANAGER_TOPIC": {
+              "Ref": "ManagerTopic"
+            },
+            "SIGNING_SECRET": {
+              "Ref": "SigningSecret"
+            }
+          }
+        },
+        "Policies": [
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "dynamodb:ConditionCheckItem",
+                  "dynamodb:GetItem",
+                  "dynamodb:PutItem",
+                  "dynamodb:UpdateItem",
+                  "dynamodb:Query",
+                  "dynamodb:Scan"
+                ],
+                "Resource": [
+                  {
+                    "Fn::GetAtt": [
+                      "People",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Requests",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Balances",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Config",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Locks",
+                      "Arn"
+                    ]
+                  }
+                ]
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "ses:SendEmail"
+                ],
+                "Resource": {
+                  "Fn::Sub": "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
+                },
+                "Condition": {
+                  "StringEquals": {
+                    "ses:FromAddress": {
+                      "Ref": "SenderEmail"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "Events": {
+          "Weekly": {
+            "Type": "Schedule",
+            "Properties": {
+              "Schedule": "cron(0 4 ? * MON *)"
+            }
+          }
+        }
+      }
+    },
+    "WeeklyLogs": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${Weekly}"
+        },
+        "RetentionInDays": 14
+      }
+    },
+    "Workflow": {
+      "Type": "AWS::Serverless::StateMachine",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${AWS::StackName}-workflow"
+        },
+        "Type": "STANDARD",
+        "Definition": {
+          "Comment": "Human approval callbacks; quota debit occurs only at final approval.",
+          "StartAt": "Prepare",
+          "States": {
+            "Prepare": {
+              "Type": "Pass",
+              "Parameters": {
+                "employee_id.$": "$.employee_id",
+                "request_id.$": "$.request_id",
+                "needs_hr.$": "$.needs_hr",
+                "seconds.$": {
+                  "Fn::Sub": "States.StringToJson('${ApprovalSeconds}')"
+                },
+                "rounds": 0
+              },
+              "Next": "ManagerApproval"
+            },
+            "ManagerApproval": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+              "Parameters": {
+                "FunctionName": {
+                  "Fn::GetAtt": [
+                    "Register",
+                    "Arn"
+                  ]
+                },
+                "Payload": {
+                  "employee_id.$": "$.employee_id",
+                  "request_id.$": "$.request_id",
+                  "stage": "manager",
+                  "token.$": "$$.Task.Token"
+                }
+              },
+              "TimeoutSecondsPath": "$.seconds",
+              "ResultPath": "$.decision",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 4,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.Timeout"
+                  ],
+                  "ResultPath": null,
+                  "Next": "ManagerReminder"
+                },
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.error",
+                  "Next": "FailureNotice"
+                }
+              ],
+              "Next": "ManagerDecision"
+            },
+            "ManagerDecision": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.decision.decision",
+                  "StringEquals": "approve",
+                  "Next": "NeedHR"
+                }
+              ],
+              "Default": "Reject"
+            },
+            "ManagerReminder": {
+              "Type": "Task",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "Remind",
+                  "Arn"
+                ]
+              },
+              "Parameters": {
+                "employee_id.$": "$.employee_id",
+                "request_id.$": "$.request_id",
+                "stage": "manager"
+              },
+              "ResultPath": null,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 4,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.error",
+                  "Next": "FailureNotice"
+                }
+              ],
+              "Next": "ManagerCount"
+            },
+            "ManagerCount": {
+              "Type": "Pass",
+              "Parameters": {
+                "employee_id.$": "$.employee_id",
+                "request_id.$": "$.request_id",
+                "needs_hr.$": "$.needs_hr",
+                "seconds.$": "$.seconds",
+                "rounds.$": "States.MathAdd($.rounds, 1)"
+              },
+              "Next": "ManagerExpiry"
+            },
+            "ManagerExpiry": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.rounds",
+                  "NumericGreaterThanEquals": 15,
+                  "Next": "Expire"
+                }
+              ],
+              "Default": "ManagerApproval"
+            },
+            "HRApproval": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+              "Parameters": {
+                "FunctionName": {
+                  "Fn::GetAtt": [
+                    "Register",
+                    "Arn"
+                  ]
+                },
+                "Payload": {
+                  "employee_id.$": "$.employee_id",
+                  "request_id.$": "$.request_id",
+                  "stage": "hr",
+                  "token.$": "$$.Task.Token"
+                }
+              },
+              "TimeoutSecondsPath": "$.seconds",
+              "ResultPath": "$.decision",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 4,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.Timeout"
+                  ],
+                  "ResultPath": null,
+                  "Next": "HRReminder"
+                },
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.error",
+                  "Next": "FailureNotice"
+                }
+              ],
+              "Next": "HRDecision"
+            },
+            "HRDecision": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.decision.decision",
+                  "StringEquals": "approve",
+                  "Next": "Approve"
+                }
+              ],
+              "Default": "Reject"
+            },
+            "HRReminder": {
+              "Type": "Task",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "Remind",
+                  "Arn"
+                ]
+              },
+              "Parameters": {
+                "employee_id.$": "$.employee_id",
+                "request_id.$": "$.request_id",
+                "stage": "hr"
+              },
+              "ResultPath": null,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 4,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.error",
+                  "Next": "FailureNotice"
+                }
+              ],
+              "Next": "HRCount"
+            },
+            "HRCount": {
+              "Type": "Pass",
+              "Parameters": {
+                "employee_id.$": "$.employee_id",
+                "request_id.$": "$.request_id",
+                "needs_hr.$": "$.needs_hr",
+                "seconds.$": "$.seconds",
+                "rounds.$": "States.MathAdd($.rounds, 1)"
+              },
+              "Next": "HRExpiry"
+            },
+            "HRExpiry": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.rounds",
+                  "NumericGreaterThanEquals": 15,
+                  "Next": "Expire"
+                }
+              ],
+              "Default": "HRApproval"
+            },
+            "NeedHR": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.needs_hr",
+                  "BooleanEquals": true,
+                  "Next": "HRApproval"
+                }
+              ],
+              "Default": "Approve"
+            },
+            "Approve": {
+              "Type": "Task",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "Finish",
+                  "Arn"
+                ]
+              },
+              "Parameters": {
+                "employee_id.$": "$.employee_id",
+                "request_id.$": "$.request_id",
+                "action": "approve"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 4,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.error",
+                  "Next": "FailureNotice"
+                }
+              ],
+              "End": true
+            },
+            "Reject": {
+              "Type": "Task",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "Finish",
+                  "Arn"
+                ]
+              },
+              "Parameters": {
+                "employee_id.$": "$.employee_id",
+                "request_id.$": "$.request_id",
+                "action": "reject"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 4,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.error",
+                  "Next": "FailureNotice"
+                }
+              ],
+              "End": true
+            },
+            "Expire": {
+              "Type": "Task",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "Finish",
+                  "Arn"
+                ]
+              },
+              "Parameters": {
+                "employee_id.$": "$.employee_id",
+                "request_id.$": "$.request_id",
+                "action": "expire"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 4,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.error",
+                  "Next": "FailureNotice"
+                }
+              ],
+              "End": true
+            },
+            "FailureNotice": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": {
+                  "Ref": "Failures"
+                },
+                "Subject": "Leave workflow failed",
+                "Message.$": "States.JsonToString($)"
+              },
+              "Next": "Failed"
+            },
+            "Failed": {
+              "Type": "Fail",
+              "Error": "LeaveWorkflowFailed"
+            }
+          }
+        },
+        "Policies": [
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "lambda:InvokeFunction"
+                ],
+                "Resource": [
+                  {
+                    "Fn::GetAtt": [
+                      "Register",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Remind",
+                      "Arn"
+                    ]
+                  },
+                  {
+                    "Fn::GetAtt": [
+                      "Finish",
+                      "Arn"
+                    ]
+                  }
+                ]
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "sns:Publish"
+                ],
+                "Resource": [
+                  {
+                    "Ref": "ManagerTopic"
+                  },
+                  {
+                    "Ref": "Failures"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "Changes": {
+      "Type": "AWS::Serverless::Function",
+      "Properties": {
+        "CodeUri": "backend/",
+        "Runtime": "python3.14",
+        "Handler": "app.changes",
+        "MemorySize": 256,
+        "Timeout": 60,
+        "Environment": {
+          "Variables": {
+            "PEOPLE": {
+              "Ref": "People"
+            },
+            "REQUESTS": {
+              "Ref": "Requests"
+            },
+            "BALANCES": {
+              "Ref": "Balances"
+            },
+            "CONFIG": {
+              "Ref": "Config"
+            },
+            "LOCKS": {
+              "Ref": "Locks"
+            },
+            "PORTAL": {
+              "Fn::Sub": "https://${CDN.DomainName}"
+            },
+            "SENDER": {
+              "Ref": "SenderEmail"
+            },
+            "HR_EMAIL": {
+              "Ref": "HREmail"
+            },
+            "MANAGER_TOPIC": {
+              "Ref": "ManagerTopic"
+            },
+            "SIGNING_SECRET": {
+              "Ref": "SigningSecret"
+            },
+            "WORKFLOW": {
+              "Ref": "Workflow"
+            }
+          }
+        },
+        "Policies": [
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "ses:SendEmail"
+                ],
+                "Resource": {
+                  "Fn::Sub": "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
+                },
+                "Condition": {
+                  "StringEquals": {
+                    "ses:FromAddress": {
+                      "Ref": "SenderEmail"
+                    }
+                  }
+                }
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "states:SendTaskSuccess"
+                ],
+                "Resource": "*"
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "states:StartExecution"
+                ],
+                "Resource": {
+                  "Ref": "Workflow"
+                }
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "sqs:SendMessage"
+                ],
+                "Resource": {
+                  "Fn::GetAtt": [
+                    "DeadLetters",
+                    "Arn"
+                  ]
+                }
+              }
+            ]
+          }
+        ],
+        "Events": {
+          "Stream": {
+            "Type": "DynamoDB",
+            "Properties": {
+              "Stream": {
+                "Fn::GetAtt": [
+                  "Requests",
+                  "StreamArn"
+                ]
+              },
+              "StartingPosition": "TRIM_HORIZON",
+              "BatchSize": 1,
+              "MaximumRetryAttempts": 5,
+              "BisectBatchOnFunctionError": true,
+              "DestinationConfig": {
+                "OnFailure": {
+                  "Type": "SQS",
+                  "Destination": {
+                    "Fn::GetAtt": [
+                      "DeadLetters",
+                      "Arn"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "ChangesLogs": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${Changes}"
+        },
+        "RetentionInDays": 14
+      }
+    },
+    "DeadLetterAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "Leave notification or workflow-start event needs replay; inspect failed stream records.",
+        "Namespace": "AWS/SQS",
+        "MetricName": "ApproximateNumberOfMessagesVisible",
+        "Dimensions": [
+          {
+            "Name": "QueueName",
+            "Value": {
+              "Fn::GetAtt": [
+                "DeadLetters",
+                "QueueName"
+              ]
+            }
+          }
+        ],
+        "Statistic": "Maximum",
+        "Period": 60,
+        "EvaluationPeriods": 1,
+        "Threshold": 0,
+        "ComparisonOperator": "GreaterThanThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "Failures"
+          }
+        ]
+      }
+    }
+  },
+  "Outputs": {
+    "PortalUrl": {
+      "Value": {
+        "Fn::Sub": "https://${CDN.DomainName}"
+      }
+    },
+    "ApiUrl": {
+      "Value": {
+        "Fn::Sub": "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/prod"
+      }
+    },
+    "UserPoolId": {
+      "Value": {
+        "Ref": "Pool"
+      }
+    },
+    "ClientId": {
+      "Value": {
+        "Ref": "Client"
+      }
+    },
+    "WebBucket": {
+      "Value": {
+        "Ref": "Web"
+      }
+    },
+    "PeopleTable": {
+      "Value": {
+        "Ref": "People"
+      }
+    },
+    "ConfigTable": {
+      "Value": {
+        "Ref": "Config"
+      }
+    },
+    "BalancesTable": {
+      "Value": {
+        "Ref": "Balances"
+      }
+    },
+    "RequestsTable": {
+      "Value": {
+        "Ref": "Requests"
+      }
+    },
+    "ManagerTopicArn": {
+      "Value": {
+        "Ref": "ManagerTopic"
+      }
+    },
+    "WorkflowArn": {
+      "Value": {
+        "Ref": "Workflow"
+      }
+    },
+    "Region": {
+      "Value": {
+        "Ref": "AWS::Region"
+      }
+    },
+    "WeeklyFunction": {
+      "Value": {
+        "Ref": "Weekly"
+      }
+    },
+    "DeadLetterQueueUrl": {
+      "Value": {
+        "Ref": "DeadLetters"
+      }
+    }
+  }
+}

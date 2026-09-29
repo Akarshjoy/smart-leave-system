@@ -1,0 +1,378 @@
+{
+  "Comment": "Human approval callbacks; quota debit occurs only at final approval.",
+  "StartAt": "Prepare",
+  "States": {
+    "Prepare": {
+      "Type": "Pass",
+      "Parameters": {
+        "employee_id.$": "$.employee_id",
+        "request_id.$": "$.request_id",
+        "needs_hr.$": "$.needs_hr",
+        "seconds.$": {
+          "Fn::Sub": "States.StringToJson('${ApprovalSeconds}')"
+        },
+        "rounds": 0
+      },
+      "Next": "ManagerApproval"
+    },
+    "ManagerApproval": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": {
+          "Fn::GetAtt": [
+            "Register",
+            "Arn"
+          ]
+        },
+        "Payload": {
+          "employee_id.$": "$.employee_id",
+          "request_id.$": "$.request_id",
+          "stage": "manager",
+          "token.$": "$$.Task.Token"
+        }
+      },
+      "TimeoutSecondsPath": "$.seconds",
+      "ResultPath": "$.decision",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.Timeout"
+          ],
+          "ResultPath": null,
+          "Next": "ManagerReminder"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "FailureNotice"
+        }
+      ],
+      "Next": "ManagerDecision"
+    },
+    "ManagerDecision": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.decision.decision",
+          "StringEquals": "approve",
+          "Next": "NeedHR"
+        }
+      ],
+      "Default": "Reject"
+    },
+    "ManagerReminder": {
+      "Type": "Task",
+      "Resource": {
+        "Fn::GetAtt": [
+          "Remind",
+          "Arn"
+        ]
+      },
+      "Parameters": {
+        "employee_id.$": "$.employee_id",
+        "request_id.$": "$.request_id",
+        "stage": "manager"
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "FailureNotice"
+        }
+      ],
+      "Next": "ManagerCount"
+    },
+    "ManagerCount": {
+      "Type": "Pass",
+      "Parameters": {
+        "employee_id.$": "$.employee_id",
+        "request_id.$": "$.request_id",
+        "needs_hr.$": "$.needs_hr",
+        "seconds.$": "$.seconds",
+        "rounds.$": "States.MathAdd($.rounds, 1)"
+      },
+      "Next": "ManagerExpiry"
+    },
+    "ManagerExpiry": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.rounds",
+          "NumericGreaterThanEquals": 15,
+          "Next": "Expire"
+        }
+      ],
+      "Default": "ManagerApproval"
+    },
+    "HRApproval": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": {
+          "Fn::GetAtt": [
+            "Register",
+            "Arn"
+          ]
+        },
+        "Payload": {
+          "employee_id.$": "$.employee_id",
+          "request_id.$": "$.request_id",
+          "stage": "hr",
+          "token.$": "$$.Task.Token"
+        }
+      },
+      "TimeoutSecondsPath": "$.seconds",
+      "ResultPath": "$.decision",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.Timeout"
+          ],
+          "ResultPath": null,
+          "Next": "HRReminder"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "FailureNotice"
+        }
+      ],
+      "Next": "HRDecision"
+    },
+    "HRDecision": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.decision.decision",
+          "StringEquals": "approve",
+          "Next": "Approve"
+        }
+      ],
+      "Default": "Reject"
+    },
+    "HRReminder": {
+      "Type": "Task",
+      "Resource": {
+        "Fn::GetAtt": [
+          "Remind",
+          "Arn"
+        ]
+      },
+      "Parameters": {
+        "employee_id.$": "$.employee_id",
+        "request_id.$": "$.request_id",
+        "stage": "hr"
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "FailureNotice"
+        }
+      ],
+      "Next": "HRCount"
+    },
+    "HRCount": {
+      "Type": "Pass",
+      "Parameters": {
+        "employee_id.$": "$.employee_id",
+        "request_id.$": "$.request_id",
+        "needs_hr.$": "$.needs_hr",
+        "seconds.$": "$.seconds",
+        "rounds.$": "States.MathAdd($.rounds, 1)"
+      },
+      "Next": "HRExpiry"
+    },
+    "HRExpiry": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.rounds",
+          "NumericGreaterThanEquals": 15,
+          "Next": "Expire"
+        }
+      ],
+      "Default": "HRApproval"
+    },
+    "NeedHR": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.needs_hr",
+          "BooleanEquals": true,
+          "Next": "HRApproval"
+        }
+      ],
+      "Default": "Approve"
+    },
+    "Approve": {
+      "Type": "Task",
+      "Resource": {
+        "Fn::GetAtt": [
+          "Finish",
+          "Arn"
+        ]
+      },
+      "Parameters": {
+        "employee_id.$": "$.employee_id",
+        "request_id.$": "$.request_id",
+        "action": "approve"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "FailureNotice"
+        }
+      ],
+      "End": true
+    },
+    "Reject": {
+      "Type": "Task",
+      "Resource": {
+        "Fn::GetAtt": [
+          "Finish",
+          "Arn"
+        ]
+      },
+      "Parameters": {
+        "employee_id.$": "$.employee_id",
+        "request_id.$": "$.request_id",
+        "action": "reject"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "FailureNotice"
+        }
+      ],
+      "End": true
+    },
+    "Expire": {
+      "Type": "Task",
+      "Resource": {
+        "Fn::GetAtt": [
+          "Finish",
+          "Arn"
+        ]
+      },
+      "Parameters": {
+        "employee_id.$": "$.employee_id",
+        "request_id.$": "$.request_id",
+        "action": "expire"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "FailureNotice"
+        }
+      ],
+      "End": true
+    },
+    "FailureNotice": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": {
+          "Ref": "Failures"
+        },
+        "Subject": "Leave workflow failed",
+        "Message.$": "States.JsonToString($)"
+      },
+      "Next": "Failed"
+    },
+    "Failed": {
+      "Type": "Fail",
+      "Error": "LeaveWorkflowFailed"
+    }
+  }
+}
